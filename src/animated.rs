@@ -531,8 +531,10 @@ fn write_track(
                     write_u16(out, 0); // pre_defined
                     write_u16(out, 0); // reserved
                     out.extend_from_slice(&[0u8; 12]); // pre_defined
-                    write_u16(out, width as u16);
-                    write_u16(out, height as u16);
+                    // VisualSampleEntry width/height are u16. Saturate rather than
+                    // silently wrap: `70000 as u16 = 4464` would emit a corrupted box.
+                    write_u16(out, width.min(0xFFFF) as u16);
+                    write_u16(out, height.min(0xFFFF) as u16);
                     write_u32(out, 0x0048_0000); // horiz resolution 72dpi
                     write_u32(out, 0x0048_0000); // vert resolution 72dpi
                     write_u32(out, 0); // reserved
