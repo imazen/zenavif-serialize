@@ -449,8 +449,12 @@ fn write_track(
         for &v in &[0x0001_0000u32, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x4000_0000] {
             write_u32(out, v);
         }
-        write_u32(out, width << 16);
-        write_u32(out, height << 16);
+        // tkhd width/height are 16.16 fixed-point u32s. Widening to u64 prevents
+        // a debug-build panic / release-build wrap when width or height >= 65536;
+        // saturate to u32::MAX so very large dimensions still produce a well-formed
+        // box (the integer part is clamped to 0xFFFF, which is the spec maximum).
+        write_u32(out, fixed_16_16_saturating(width));
+        write_u32(out, fixed_16_16_saturating(height));
         end_box(out, pos);
     }
 
@@ -703,6 +707,18 @@ fn write_u32_at(out: &mut [u8], pos: usize, value: u32) {
     }
 }
 
+/// Convert an unsigned integer dimension to ISO/IEC 14496-12 16.16 fixed-point,
+/// saturating at u32::MAX (i.e. integer part clamped to 0xFFFF).
+///
+/// `value << 16` panics in debug builds and silently wraps in release builds for
+/// any `value >= 0x10000`. The tkhd width/height fields are u32 16.16 — values
+/// representing > 65535 px integer width can't be encoded exactly, so saturate
+/// rather than crash or emit a corrupted box.
+fn fixed_16_16_saturating(value: u32) -> u32 {
+    let widened = (value as u64) << 16;
+    if widened > u32::MAX as u64 { u32::MAX } else { widened as u32 }
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -840,6 +856,30 @@ mod tests {
         let parser = zenavif_parse::AvifParser::from_bytes(&avif).unwrap();
         let info = parser.animation_info().expect("animation info");
         assert_eq!(info.frame_count, 2);
+    }
+
+    #[test]
+    fn very_large_width_does_not_panic() {
+        // Regression: tkhd encoded width as `width << 16`, which panics in debug
+        // builds for any width >= 65536. Saturation via fixed_16_16_saturating
+        // produces a well-formed (clamped) box and never panics.
+        assert_eq!(fixed_16_16_saturating(0), 0);
+        assert_eq!(fixed_16_16_saturating(1), 0x0001_0000);
+        assert_eq!(fixed_16_16_saturating(0xFFFF), 0xFFFF_0000);
+        assert_eq!(fixed_16_16_saturating(0x1_0000), u32::MAX);
+        assert_eq!(fixed_16_16_saturating(70_000), u32::MAX);
+        assert_eq!(fixed_16_16_saturating(u32::MAX), u32::MAX);
+
+        let frames = [AnimFrame::new(b"f", 100).with_sync(true)];
+        let mut image = AnimatedImage::new();
+        image.set_color_config(basic_av1c());
+        // 70000 used to panic at write_u32(out, width << 16).
+        let avif = image.serialize(70_000, 70_000, &frames, b"seq", None);
+        // File is structurally valid.
+        assert_eq!(&avif[4..8], b"ftyp");
+        let parser = zenavif_parse::AvifParser::from_bytes(&avif).unwrap();
+        let info = parser.animation_info().expect("animation info");
+        assert_eq!(info.frame_count, 1);
     }
 
     #[test]
