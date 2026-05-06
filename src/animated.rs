@@ -112,8 +112,9 @@ impl AnimatedImage {
     // ftyp
     write_ftyp(&mut out);
 
-    // meta — declares primary item for still-frame interop
-    write_meta(
+    // meta — declares primary item for still-frame interop. Returns the byte position
+    // of the iloc extent_offset placeholder so we can patch it without scanning.
+    let iloc_offset_pos = write_meta(
         &mut out,
         width,
         height,
@@ -125,27 +126,29 @@ impl AnimatedImage {
         self.mdcv.as_ref(),
     );
 
-    // moov
+    // moov — each write_track returns the byte position of its stco placeholder.
     let moov_pos = begin_box(&mut out, b"moov");
     write_mvhd(&mut out, self.timescale, total_duration, next_track_id);
-    write_track(
+    let color_stco_pos = write_track(
         &mut out, 1, width, height,
         self.timescale, total_duration,
         &color_frames, &durations, &sync_indices,
         color_seq_header, &self.color_config,
         false,
     );
-    if has_alpha {
+    let alpha_stco_pos = if has_alpha {
         let alpha_seq = alpha_seq_header.unwrap();
         let alpha_cfg = self.alpha_config.as_ref().unwrap();
-        write_track(
+        Some(write_track(
             &mut out, 2, width, height,
             self.timescale, total_duration,
             &alpha_frames, &durations, &sync_indices,
             alpha_seq, alpha_cfg,
             true,
-        );
-    }
+        ))
+    } else {
+        None
+    };
     end_box(&mut out, moov_pos);
 
     // mdat
@@ -160,11 +163,14 @@ impl AnimatedImage {
     }
     end_box(&mut out, mdat_pos);
 
-    // Patch placeholder offsets
-    if has_alpha {
-        patch_offset_placeholders(&mut out, &[mdat_data_start as u32, alpha_data_start as u32], mdat_data_start as u32);
-    } else {
-        patch_offset_placeholders(&mut out, &[mdat_data_start as u32], mdat_data_start as u32);
+    // Patch placeholder offsets at exact recorded positions. We never scan the buffer
+    // for sentinel byte patterns: AV1 frame payloads can legitimately contain those
+    // bytes (and an attacker could deliberately seed them), so a scan-and-replace
+    // approach would silently corrupt user data.
+    write_u32_at(&mut out, iloc_offset_pos, mdat_data_start as u32);
+    write_u32_at(&mut out, color_stco_pos, mdat_data_start as u32);
+    if let Some(pos) = alpha_stco_pos {
+        write_u32_at(&mut out, pos, alpha_data_start as u32);
     }
 
     out
@@ -234,7 +240,9 @@ fn write_meta(
     colr: Option<&ColrBox>,
     clli: Option<&ClliBox>,
     mdcv: Option<&MdcvBox>,
-) {
+) -> usize {
+    // Records the byte position of the iloc extent_offset placeholder.
+    let iloc_offset_pos: usize;
     let meta_pos = begin_box(out, b"meta");
     write_fullbox(out, 0, 0);
 
@@ -267,6 +275,7 @@ fn write_meta(
         write_u16(out, 1); // item_id
         write_u16(out, 0); // data_reference_index
         write_u16(out, 1); // extent_count
+        iloc_offset_pos = out.len();
         write_u32(out, ILOC_PLACEHOLDER); // extent_offset (patched later)
         write_u32(out, first_frame_len); // extent_length
         end_box(out, pos);
@@ -381,6 +390,7 @@ fn write_meta(
     }
 
     end_box(out, meta_pos);
+    iloc_offset_pos
 }
 
 fn write_mvhd(out: &mut Vec<u8>, timescale: u32, duration: u64, next_track_id: u32) {
@@ -416,7 +426,9 @@ fn write_track(
     seq_header: &[u8],
     av1c: &Av1CBox,
     is_alpha: bool,
-) {
+) -> usize {
+    // Records the byte position of the stco chunk_offset placeholder.
+    let stco_offset_pos: usize;
     let trak_pos = begin_box(out, b"trak");
 
     // tkhd
@@ -576,14 +588,16 @@ fn write_track(
                     end_box(out, pos);
                 }
 
-                // stco (chunk offset — placeholder, patched later)
-                {
+                // stco (chunk offset — placeholder, patched later via stco_offset_pos)
+                stco_offset_pos = {
                     let pos = begin_box(out, b"stco");
                     write_fullbox(out, 0, 0);
                     write_u32(out, 1); // entry_count
+                    let p = out.len();
                     write_u32(out, STCO_PLACEHOLDER);
                     end_box(out, pos);
-                }
+                    p
+                };
 
                 // stss (sync samples)
                 {
@@ -615,6 +629,7 @@ fn write_track(
     }
 
     end_box(out, trak_pos);
+    stco_offset_pos
 }
 
 // ─── Shared utilities ────────────────────────────────────────────────
@@ -674,25 +689,20 @@ fn write_mdcv(out: &mut Vec<u8>, mdcv: &MdcvBox) {
     end_box(out, pos);
 }
 
-/// Find and replace placeholder values with actual offsets.
-fn patch_offset_placeholders(out: &mut [u8], stco_offsets: &[u32], iloc_offset: u32) {
-    let stco_placeholder = STCO_PLACEHOLDER.to_be_bytes();
-    let iloc_placeholder = ILOC_PLACEHOLDER.to_be_bytes();
-    let mut stco_idx = 0;
-    let mut i = 0;
-    while i + 4 <= out.len() {
-        if stco_idx < stco_offsets.len() && out[i..i + 4] == stco_placeholder {
-            out[i..i + 4].copy_from_slice(&stco_offsets[stco_idx].to_be_bytes());
-            stco_idx += 1;
-            i += 4;
-        } else if out[i..i + 4] == iloc_placeholder {
-            out[i..i + 4].copy_from_slice(&iloc_offset.to_be_bytes());
-            i += 4;
-        } else {
-            i += 1;
-        }
+/// Write a big-endian u32 at an exact byte position.
+///
+/// Used to patch iloc/stco offset placeholders at the positions recorded when
+/// they were emitted. This avoids any buffer-wide scanning for sentinel byte
+/// patterns, which would risk corrupting AV1 frame payloads that happen to
+/// contain those bytes (a real possibility, and one an attacker could trigger
+/// deliberately by seeding the sentinel into encoded data).
+fn write_u32_at(out: &mut [u8], pos: usize, value: u32) {
+    debug_assert!(pos + 4 <= out.len());
+    if pos + 4 <= out.len() {
+        out[pos..pos + 4].copy_from_slice(&value.to_be_bytes());
     }
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -774,6 +784,61 @@ mod tests {
 
         let parser = zenavif_parse::AvifParser::from_bytes(&avif).unwrap();
         let info = parser.animation_info().expect("should have animation info");
+        assert_eq!(info.frame_count, 2);
+    }
+
+    #[test]
+    fn frame_payload_containing_placeholder_sentinels_is_not_corrupted() {
+        // Regression: the old patcher walked the output buffer searching for
+        // 0xDEADBEEF / 0xDEADBEE0 and overwrote any 4-byte match. Animation frame
+        // payloads can legitimately contain those bytes (and an attacker could
+        // deliberately seed them). This test puts both sentinels into multiple
+        // frames at varied alignments and asserts the bytes survive serialization
+        // intact.
+        let stco = STCO_PLACEHOLDER.to_be_bytes();
+        let iloc = ILOC_PLACEHOLDER.to_be_bytes();
+
+        let mut frame1 = vec![0xAAu8; 33]; // odd-aligned sentinel
+        frame1.extend_from_slice(&stco);
+        frame1.extend_from_slice(&[0xBB; 16]);
+        frame1.extend_from_slice(&iloc);
+        frame1.extend_from_slice(&[0xCC; 32]);
+
+        let mut frame2 = vec![0u8; 4];     // sentinels at start (after offset 0)
+        frame2.extend_from_slice(&stco);
+        frame2.extend_from_slice(&iloc);
+        frame2.extend_from_slice(&[0xEE; 100]);
+
+        let mut alpha1 = vec![0x44u8; 8];
+        alpha1.extend_from_slice(&stco);
+        alpha1.extend_from_slice(&[0x55; 16]);
+        let mut alpha2 = vec![0x66u8; 16];
+        alpha2.extend_from_slice(&iloc);
+        alpha2.extend_from_slice(&[0x77; 8]);
+
+        let frames = [
+            AnimFrame::new(frame1.as_slice(), 100).with_alpha(alpha1.as_slice()).with_sync(true),
+            AnimFrame::new(frame2.as_slice(), 200).with_alpha(alpha2.as_slice()),
+        ];
+        let mut image = AnimatedImage::new();
+        image.set_color_config(basic_av1c());
+        image.set_alpha_config(mono_av1c());
+        let avif = image.serialize(64, 64, &frames, b"colseq", Some(b"alphaseq"));
+
+        // Each frame's bytes must appear verbatim somewhere in the file.
+        // (We used to fail this when sentinels in payload were overwritten.)
+        assert!(avif.windows(frame1.len()).any(|w| w == frame1.as_slice()),
+            "frame1 (with both sentinels) corrupted by placeholder scan");
+        assert!(avif.windows(frame2.len()).any(|w| w == frame2.as_slice()),
+            "frame2 (with both sentinels) corrupted by placeholder scan");
+        assert!(avif.windows(alpha1.len()).any(|w| w == alpha1.as_slice()),
+            "alpha1 corrupted by placeholder scan");
+        assert!(avif.windows(alpha2.len()).any(|w| w == alpha2.as_slice()),
+            "alpha2 corrupted by placeholder scan");
+
+        // Parser still resolves animation structure correctly.
+        let parser = zenavif_parse::AvifParser::from_bytes(&avif).unwrap();
+        let info = parser.animation_info().expect("animation info");
         assert_eq!(info.frame_count, 2);
     }
 
