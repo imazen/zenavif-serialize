@@ -101,6 +101,18 @@ struct GainMapConfig {
     chroma_subsampling: ChromaSubsampling,
     /// Whether the gain map is monochrome.
     monochrome: bool,
+    /// Optional Gain-MLP (Canham et al. 2025) bake bytes. When set,
+    /// the muxer emits an auxiliary `'zmlp'` item containing this
+    /// payload alongside the traditional `av01` gain-map image. Both
+    /// representations encode the same SDR↔HDR relationship; decoders
+    /// that recognise `'zmlp'` get the higher-quality MLP path, the
+    /// rest fall back to the av01 pixel gain map.
+    ///
+    /// **Experimental.** `'zmlp'` is a vendor-prefixed item type and
+    /// is not part of any ratified spec. The wire-format choice may
+    /// change as standards bodies pick a canonical encoding for MLP
+    /// gain maps. Don't rely on cross-implementation interop yet.
+    mlp_bake: Option<Vec<u8>>,
 }
 
 /// Makes an AVIF file given encoded AV1 data (create the data with [`rav1e`](https://lib.rs/rav1e))
@@ -337,7 +349,32 @@ impl Aviffy {
             alt_colr: None,
             chroma_subsampling: ChromaSubsampling::YUV420,
             monochrome: false,
+            mlp_bake: None,
         });
+        self
+    }
+
+    /// Attach a Gain-MLP (Canham et al. 2025) bake to the gain-map
+    /// configuration. The bake bytes are written as an auxiliary
+    /// `'zmlp'` item in the AVIF container, alongside the traditional
+    /// `av01` gain-map image. Decoders that recognise `'zmlp'` get
+    /// the higher-quality MLP reconstruction path
+    /// (`zentone::GainMapMlpDecoder`); the rest fall back to the
+    /// pixel gain map.
+    ///
+    /// Must be called after [`Self::set_gain_map`] (the bake is
+    /// linked to the same `tmap` item). Calling without a prior
+    /// `set_gain_map` is a no-op.
+    ///
+    /// **Experimental.** `'zmlp'` is a vendor-prefixed item type and
+    /// is not part of any ratified spec — see the field-level
+    /// docstring in `GainMapConfig::mlp_bake` for the wire-format
+    /// caveats. Don't rely on cross-implementation interop yet.
+    #[inline]
+    pub fn set_gain_map_mlp_bake(&mut self, bake: Vec<u8>) -> &mut Self {
+        if let Some(ref mut gm) = self.gain_map {
+            gm.mlp_bake = Some(bake);
+        }
         self
     }
 
@@ -609,7 +646,6 @@ impl Aviffy {
             next_item_id += 1;
             let tmap_id = next_item_id;
             next_item_id += 1;
-            let _ = next_item_id;
 
             // Gain map image item (av01)
             image_items.push(InfeBox {
@@ -683,6 +719,41 @@ impl Aviffy {
                 to_ids,
                 typ: FourCC(*b"dimg"),
             });
+
+            // Optional Gain-MLP bake — emitted as a vendor-prefixed
+            // 'zmlp' item linked to the tmap via an `'auxl'` iref
+            // (auxiliary item reference). Decoders that don't know
+            // the 'zmlp' item type skip it per ISOBMFF rules; those
+            // that do (e.g., `zentone::GainMapMlpDecoder` consumers)
+            // load the bake bytes by item_id and reconstruct HDR
+            // pixel-by-pixel from the SDR base.
+            if let Some(ref bake_bytes) = gm.mlp_bake {
+                let mlp_id = next_item_id;
+                #[allow(unused_assignments)]
+                {
+                    next_item_id += 1;
+                }
+
+                image_items.push(InfeBox {
+                    id: mlp_id,
+                    typ: FourCC(*b"zmlp"),
+                    name: "",
+                    content_type: "",
+                });
+
+                iloc_items.push(IlocItem {
+                    id: mlp_id,
+                    extents: [IlocExtent { data: bake_bytes }],
+                });
+
+                let mut to_ids_mlp = ArrayVec::new();
+                to_ids_mlp.push(mlp_id);
+                multi_irefs.push(IrefMultiEntryBox {
+                    from_id: tmap_id,
+                    to_ids: to_ids_mlp,
+                    typ: FourCC(*b"auxl"),
+                });
+            }
         }
 
         iloc_items.push(IlocItem {
@@ -1700,4 +1771,90 @@ fn gain_map_multichannel_metadata_bytes_roundtrip() {
     let roundtripped = parsed.to_bytes();
     assert_eq!(original_meta, roundtripped,
         "multichannel tmap payload bytes must survive roundtrip");
+}
+
+// ─── Gain-MLP bake integration (Canham 2025) ────────────────────────
+
+#[test]
+fn gain_map_with_mlp_bake_round_trips_traditional_path() {
+    // Adding a Gain-MLP bake alongside the traditional av01 gain map
+    // must not affect the existing path — parsers that don't know
+    // about 'zmlp' should still pull out the av01 gain map and the
+    // ISO 21496-1 metadata unchanged.
+    let primary_data = b"primary_av1_data_aaa";
+    let gain_map_data = b"av01_gain_map_pixel_data";
+    let metadata = make_test_tmap_metadata(false, true, 0, 1, 1, 1);
+    // Stand-in for a real Gain-MLP bake: a 32-byte distinct payload
+    // we can grep for in the output without parsing 'zmlp' items.
+    let mlp_bake: Vec<u8> = (0..32).map(|i| i as u8 ^ 0xA5).collect();
+
+    let avif = Aviffy::new()
+        .set_gain_map(gain_map_data.to_vec(), 4, 4, 8, metadata.clone())
+        .set_gain_map_mlp_bake(mlp_bake.clone())
+        .to_vec(primary_data, None, 10, 20, 8);
+
+    let parser = zenavif_parse::AvifParser::from_bytes(&avif).unwrap();
+    assert_eq!(parser.primary_data().unwrap().as_ref(), &primary_data[..]);
+    let gm_data = parser.gain_map_data().expect("gain map data present").unwrap();
+    assert_eq!(gm_data.as_ref(), &gain_map_data[..]);
+    let gm_meta = parser.gain_map_metadata().expect("metadata");
+    assert!(!gm_meta.is_multichannel);
+    assert!(gm_meta.use_base_colour_space);
+}
+
+#[test]
+fn gain_map_mlp_bake_bytes_are_embedded() {
+    // Search the encoded AVIF for the bake payload — it must be
+    // present byte-for-byte in the iloc-referenced data span. This
+    // is a coarse "the bytes made it through" check while the
+    // parser side gains a proper `'zmlp'` item extractor.
+    let primary_data = b"primary_xyz";
+    let gain_map_data = b"av01_gm_xyz";
+    let metadata = make_test_tmap_metadata(false, true, 0, 1, 1, 1);
+    // Choose a payload unlikely to occur in the surrounding container
+    // bytes by accident — random-shaped bytes plus a sentinel.
+    let mut mlp_bake = Vec::new();
+    mlp_bake.extend_from_slice(b"ZMLP_BAKE_SENTINEL");
+    for i in 0..128u8 {
+        mlp_bake.push(i.wrapping_mul(37).wrapping_add(0x5A));
+    }
+
+    let avif = Aviffy::new()
+        .set_gain_map(gain_map_data.to_vec(), 4, 4, 8, metadata)
+        .set_gain_map_mlp_bake(mlp_bake.clone())
+        .to_vec(primary_data, None, 10, 20, 8);
+
+    let needle = &mlp_bake[..];
+    let found = avif
+        .windows(needle.len())
+        .any(|w| w == needle);
+    assert!(
+        found,
+        "Gain-MLP bake bytes must be present in the encoded AVIF"
+    );
+
+    // 'zmlp' item type must appear somewhere in the InfeBox listing.
+    assert!(
+        avif.windows(4).any(|w| w == b"zmlp"),
+        "'zmlp' item type code must appear in the encoded AVIF"
+    );
+    // 'auxl' iref type must appear too (the linkage from tmap → bake).
+    assert!(
+        avif.windows(4).any(|w| w == b"auxl"),
+        "'auxl' iref type must appear in the encoded AVIF"
+    );
+}
+
+#[test]
+fn gain_map_mlp_bake_without_set_gain_map_is_noop() {
+    // set_gain_map_mlp_bake before set_gain_map is documented as a
+    // no-op (the bake has nowhere to attach). Ensure no panic + the
+    // resulting AVIF has no 'zmlp' item.
+    let mut aviffy = Aviffy::new();
+    aviffy.set_gain_map_mlp_bake(vec![1, 2, 3, 4]);
+    let avif = aviffy.to_vec(b"primary", None, 8, 8, 8);
+    assert!(
+        !avif.windows(4).any(|w| w == b"zmlp"),
+        "no 'zmlp' item expected when set_gain_map was never called"
+    );
 }
